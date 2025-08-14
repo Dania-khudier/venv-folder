@@ -2,143 +2,294 @@ import os
 import fitz
 import json
 from datetime import datetime
+from ollama import Client
+import sqlite3
 
-# تغيير مسار العمل إلى مجلد الملف الحالي
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
-
-# دالة لاستخراج النص من صفحة PDF
-def extract_text_from_page(page):
-    text = page.get_text("text")
-    text = " ".join(text.split())
-    return text
-
-# دالة لاستخراج الصور من صفحة PDF
-def extract_images_from_page(doc, page, page_num, images_folder, max_per_folder=50):
-    images = page.get_images(full=True)
-    img_count = 0
-    for img_info in images:
-        xref = img_info[0]
-        pix = fitz.Pixmap(doc, xref)
-        img_count += 1
-
-        folder_index = (img_count - 1) // max_per_folder + 1
-        folder_path = os.path.join(images_folder, f"images_batch_{folder_index}")
-        os.makedirs(folder_path, exist_ok=True)
-
-        img_filename = os.path.join(folder_path, f"page{page_num}_img{img_count}.png")
-
-        if pix.n > 4 or (pix.colorspace and pix.colorspace.n > 3):
-            pix = fitz.Pixmap(fitz.csRGB, pix)
-        elif pix.alpha:
-            pix0 = fitz.Pixmap(fitz.csRGB, pix)
-            pix = fitz.Pixmap(fitz.csRGB, pix0)
-            pix0 = None
-        
-        try:
-            pix.save(img_filename)
-        except Exception as e:
-            print(f"حدث خطأ أثناء حفظ الصورة: {str(e)}")
-        finally:
-            pix = None
-    return img_count
-
-# دالة رئيسية لاستخراج النصوص والصور من ملف PDF
-def extract_text_and_images(pdf_path, output_folder, max_images_per_folder=50):
-    os.makedirs(output_folder, exist_ok=True)
-    images_folder = os.path.join(output_folder, "images")
-    os.makedirs(images_folder, exist_ok=True)
+# -------------------- استخراج النصوص والصور من PDF --------------------
+def extract_text_and_images(pdf_path, output_dir, max_images_per_folder=50):
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    images_dir = os.path.join(output_dir, "images")
+    if not os.path.exists(images_dir):
+        os.makedirs(images_dir)
     
     doc = fitz.open(pdf_path)
+    image_counter = 0
+    folder_counter = 0
+    current_image_dir = os.path.join(images_dir, f"images_{folder_counter}")
+    os.makedirs(current_image_dir, exist_ok=True)
     
-    for page_num, page in enumerate(doc, start=1):
-        page_text = extract_text_from_page(page)
-        txt_filename = os.path.join(output_folder, f"page_{page_num}.txt")
-        with open(txt_filename, "w", encoding="utf-8") as f:
-            f.write(page_text)
+    for page_num in range(len(doc)):
+        page = doc.load_page(page_num)
+        text = page.get_text()
         
-        img_count = extract_images_from_page(doc, page, page_num, images_folder, max_images_per_folder)
-        print(f"Page {page_num} processed: {len(page_text)} characters, {img_count} images saved.")
+        # حفظ النص
+        with open(os.path.join(output_dir, f"page_{page_num}.txt"), "w", encoding="utf-8") as f:
+            f.write(text)
+        
+        # استخراج الصور
+        image_list = page.get_images(full=True)
+        for img_index, img in enumerate(image_list):
+            xref = img[0]
+            base_image = doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            image_ext = base_image["ext"]
+            image_filename = f"page{page_num}_img{img_index}.{image_ext}"
+            image_path = os.path.join(current_image_dir, image_filename)
+            
+            with open(image_path, "wb") as f:
+                f.write(image_bytes)
+            image_counter += 1
+            
+            if image_counter >= max_images_per_folder:
+                image_counter = 0
+                folder_counter += 1
+                current_image_dir = os.path.join(images_dir, f"images_{folder_counter}")
+                os.makedirs(current_image_dir, exist_ok=True)
     
-    print("Extraction completed successfully!")
+    print("تم استخراج النصوص والصور بنجاح.")
 
-
-
-# دالة لإنشاء بيانات وصفية للقطع النصية
-def generate_metadata(page_num, chunk_num, original_filename):
-    return {
-        "source": original_filename,
-        "page_number": page_num,
-        "chunk_number": chunk_num,
-        "created_at": datetime.now().isoformat(),
-        "processing_info": {
-            "tool": "PDF Text Extractor",
-            "version": "1.0"
-        }
-    }
-
-# دالة لإنشاء تمثيل رقمي للنص 
-def generate_embeddings(text):
-    return [len(text)] * 10  
-
-# دالة لتقسيم النص إلى أجزاء أصغر مع تداخل
-def split_into_chunks(text, chunk_size=1000, overlap=200):
-    """تقسم النص إلى قطع متداخلة بحجم محدد"""
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start += (chunk_size - overlap)
-    return chunks
-
-# دالة رئيسية لمعالجة القطع النصية
-def process_chunks(input_folder, output_folder, chunk_size=1000):
-    os.makedirs(output_folder, exist_ok=True)
+# -------------------- معالجة القطع النصية --------------------
+def process_chunks(input_dir, output_dir, chunk_size=1000, overlap=200):
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
     
-    metadata_folder = os.path.join(output_folder, "metadata")
-    os.makedirs(metadata_folder, exist_ok=True)
+    metadata_dir = os.path.join(output_dir, "metadata")
+    embeddings_dir = os.path.join(output_dir, "embeddings")
+    os.makedirs(metadata_dir, exist_ok=True)
+    os.makedirs(embeddings_dir, exist_ok=True)
     
-    embeddings_folder = os.path.join(output_folder, "embeddings")
-    os.makedirs(embeddings_folder, exist_ok=True)
+    client = Client(host='http://localhost:11434')
+    model_name = "nomic-embed-text"
+    
+    for filename in os.listdir(input_dir):
+        if filename.endswith(".txt"):
+            page_num = filename.split("_")[1].split(".")[0]
+            file_path = os.path.join(input_dir, filename)
+            
+            with open(file_path, "r", encoding="utf-8") as f:
+                text = f.read()
+            
+            # تقسيم النص إلى chunks متداخلة
+            chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size - overlap)]
+            
+            for i, chunk in enumerate(chunks):
+                chunk_filename = f"page_{page_num}_chunk_{i}.txt"
+                with open(os.path.join(output_dir, chunk_filename), "w", encoding="utf-8") as f:
+                    f.write(chunk)
+                
+                # إنشاء metadata
+                metadata = {
+                    "page": page_num,
+                    "chunk": i,
+                    "size": len(chunk)
+                }
+                metadata_filename = f"page_{page_num}_chunk_{i}_metadata.json"
+                with open(os.path.join(metadata_dir, metadata_filename), "w", encoding="utf-8") as f:
+                    json.dump(metadata, f)
+                
+                # توليد embeddings
+                response = client.embeddings(model=model_name, prompt=chunk)
+                embeddings = response["embedding"]
+                embeddings_data = {
+                    "embeddings": embeddings,
+                    "model": model_name,
+                    "generated_at": datetime.now().isoformat()
+                }
+                embeddings_filename = f"page_{page_num}_chunk_{i}_embeddings.json"
+                with open(os.path.join(embeddings_dir, embeddings_filename), "w", encoding="utf-8") as f:
+                    json.dump(embeddings_data, f)
+    
+    print("تم معالجة القطع النصية بنجاح.")
+
+# -------------------- إعداد قاعدة البيانات --------------------
+def setup_database(db_name="pdf_data.db"):
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), db_name)
+
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS pages (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 page_number INTEGER,
+                 content TEXT,
+                 created_at TEXT)''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS images (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 page_number INTEGER,
+                 image_path TEXT,
+                 created_at TEXT)''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS chunks (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 page_id INTEGER,
+                 chunk_number INTEGER,
+                 content TEXT,
+                 created_at TEXT,
+                 FOREIGN KEY (page_id) REFERENCES pages(id))''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS embeddings (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 chunk_id INTEGER,
+                 embeddings_data TEXT,
+                 model TEXT,
+                 generated_at TEXT,
+                 FOREIGN KEY (chunk_id) REFERENCES chunks(id))''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS metadata (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 chunk_id INTEGER,
+                 metadata_json TEXT,
+                 created_at TEXT,
+                 FOREIGN KEY (chunk_id) REFERENCES chunks(id))''')
+    
+    conn.commit()
+    conn.close()
+    
+    print(f" قاعدة البيانات تم إنشاؤها في: {os.path.abspath(db_path)}")
+
+# -------------------- حفظ الصفحات في قاعدة البيانات --------------------
+def save_pages_to_db(input_folder, db_name="pdf_data.db"):
+    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.abspath(__file__)), db_name))
+    c = conn.cursor()
     
     for filename in os.listdir(input_folder):
         if filename.endswith(".txt"):
-            with open(os.path.join(input_folder, filename), 'r', encoding='utf-8') as f:
-                text = f.read()
-            
             try:
                 page_num = int(filename.split('_')[1].split('.')[0])
             except:
                 page_num = 0
             
-            chunks = split_into_chunks(text, chunk_size)
+            with open(os.path.join(input_folder, filename), 'r', encoding='utf-8') as f:
+                content = f.read()
             
-            for i, chunk in enumerate(chunks, 1):
-                chunk_filename = f"{os.path.splitext(filename)[0]}_chunk_{i}.txt"
-                with open(os.path.join(output_folder, chunk_filename), 'w', encoding='utf-8') as f:
-                    f.write(chunk)
-                
-                metadata = generate_metadata(page_num, i, filename)
-                metadata_filename = f"{os.path.splitext(chunk_filename)[0]}_metadata.json"
-                with open(os.path.join(metadata_folder, metadata_filename), 'w', encoding='utf-8') as f:
-                    json.dump(metadata, f, ensure_ascii=False, indent=2)
-                
-                embeddings = generate_embeddings(chunk)
-                embeddings_filename = f"{os.path.splitext(chunk_filename)[0]}_embeddings.json"
-                with open(os.path.join(embeddings_folder, embeddings_filename), 'w', encoding='utf-8') as f:
-                    json.dump({"embeddings": embeddings}, f, ensure_ascii=False, indent=2)
+            created_at = datetime.now().isoformat()
+            
+            c.execute('''INSERT INTO pages (page_number, content, created_at)
+                         VALUES (?, ?, ?)''', 
+                      (page_num, content, created_at))
     
-    print(f"تم تقسيم الملفات إلى قطع بحجم {chunk_size} حرف مع إنشاء metadata وembeddings")
+    conn.commit()
+    conn.close()
+    print(f"تم حفظ صفحات النص في قاعدة البيانات")
 
+# -------------------- حفظ الصور في قاعدة البيانات --------------------
+def save_images_to_db(output_dir, db_name="pdf_data.db"):
+    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.abspath(__file__)), db_name))
+    c = conn.cursor()
+    
+    images_folder = os.path.join(output_dir, "images")
+    if not os.path.exists(images_folder):
+        print("مجلد الصور غير موجود، سيتم تخطي حفظ الصور.")
+        conn.close()
+        return
+    
+    for root, dirs, files in os.walk(images_folder):
+        for filename in files:
+            if filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp")):
+                try:
+                    parts = filename.split('_')
+                    page_num = int(parts[0].replace("page", ""))
+                except:
+                    page_num = 0
+                
+                image_path = os.path.join(root, filename)
+                created_at = datetime.now().isoformat()
+                
+                c.execute('''INSERT INTO images (page_number, image_path, created_at)
+                             VALUES (?, ?, ?)''', 
+                          (page_num, image_path, created_at))
+    
+    conn.commit()
+    conn.close()
+    print("تم حفظ الصور في قاعدة البيانات.")
 
+# -------------------- حفظ القطع النصية والـ embeddings في قاعدة البيانات --------------------
+def save_chunks_to_db(output_folder, db_name="pdf_data.db"):
+    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.abspath(__file__)), db_name))
+    c = conn.cursor()
+    
+    metadata_folder = os.path.join(output_folder, "metadata")
+    embeddings_folder = os.path.join(output_folder, "embeddings")
+    
+    page_map = {}
+    c.execute("SELECT id, page_number FROM pages")
+    for row in c.fetchall():
+        page_map[row[1]] = row[0]
+    
+    for filename in os.listdir(output_folder):
+        if filename.endswith(".txt") and "_chunk_" in filename:
+            try:
+                parts = filename.split('_')
+                page_num = int(parts[1])
+                chunk_num = int(parts[3].split('.')[0])
+            except:
+                page_num = 0
+                chunk_num = 0
+            
+            page_id = page_map.get(page_num, None)
+            
+            if page_id is None:
+                continue
+            
+            with open(os.path.join(output_folder, filename), 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            created_at = datetime.now().isoformat()
+            c.execute('''INSERT INTO chunks (page_id, chunk_number, content, created_at)
+                         VALUES (?, ?, ?, ?)''', 
+                      (page_id, chunk_num, content, created_at))
+            chunk_id = c.lastrowid
+            
+            metadata_filename = f"{os.path.splitext(filename)[0]}_metadata.json"
+            metadata_path = os.path.join(metadata_folder, metadata_filename)
+            if os.path.exists(metadata_path):
+                with open(metadata_path, 'r', encoding='utf-8') as f:
+                    metadata = json.load(f)
+                
+                c.execute('''INSERT INTO metadata (chunk_id, metadata_json, created_at)
+                             VALUES (?, ?, ?)''', 
+                          (chunk_id, json.dumps(metadata), created_at))
+            
+            embeddings_filename = f"{os.path.splitext(filename)[0]}_embeddings.json"
+            embeddings_path = os.path.join(embeddings_folder, embeddings_filename)
+            if os.path.exists(embeddings_path):
+                with open(embeddings_path, 'r', encoding='utf-8') as f:
+                    embeddings_data = json.load(f)
+                
+                c.execute('''INSERT INTO embeddings (chunk_id, embeddings_data, model, generated_at)
+                             VALUES (?, ?, ?, ?)''', 
+                          (chunk_id, json.dumps(embeddings_data["embeddings"]), 
+                           embeddings_data["model"], embeddings_data["generated_at"]))
+    
+    conn.commit()
+    conn.close()
+    print("تم حفظ القطع النصية والـ embeddings والـ metadata في قاعدة البيانات.")
+
+# -------------------- التنفيذ الرئيسي --------------------
 if __name__ == "__main__":
     pdf_file = "Biology.pdf"
     output_dir = "extracted_pages"
     chunks_dir = "extracted_chunks"
     
     if os.path.exists(pdf_file):
+        # إعداد قاعدة البيانات
+        setup_database()
+        
+        # استخراج النصوص والصور
         extract_text_and_images(pdf_file, output_dir, max_images_per_folder=50)
-        process_chunks(output_dir, chunks_dir, chunk_size=1000)
+        
+        # حفظ الصفحات والصور في قاعدة البيانات
+        save_pages_to_db(output_dir)
+        save_images_to_db(output_dir)
+        
+        # معالجة القطع النصية
+        process_chunks(output_dir, chunks_dir, chunk_size=1000, overlap=200)
+        
+        # حفظ القطع النصية والـ embeddings في قاعدة البيانات
+        save_chunks_to_db(chunks_dir)
     else:
         print(f"الملف {pdf_file} غير موجود. يرجى التأكد من اسم الملف.")
       # Biology.pdf
