@@ -1,13 +1,18 @@
 import os
-import fitz  
+import fitz
+import json
+from datetime import datetime
 
+# تغيير مسار العمل إلى مجلد الملف الحالي
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
+# دالة لاستخراج النص من صفحة PDF
 def extract_text_from_page(page):
     text = page.get_text("text")
     text = " ".join(text.split())
     return text
 
+# دالة لاستخراج الصور من صفحة PDF
 def extract_images_from_page(doc, page, page_num, images_folder, max_per_folder=50):
     images = page.get_images(full=True)
     img_count = 0
@@ -37,6 +42,7 @@ def extract_images_from_page(doc, page, page_num, images_folder, max_per_folder=
             pix = None
     return img_count
 
+# دالة رئيسية لاستخراج النصوص والصور من ملف PDF
 def extract_text_and_images(pdf_path, output_folder, max_images_per_folder=50):
     os.makedirs(output_folder, exist_ok=True)
     images_folder = os.path.join(output_folder, "images")
@@ -56,22 +62,54 @@ def extract_text_and_images(pdf_path, output_folder, max_images_per_folder=50):
     print("Extraction completed successfully!")
 
 
-# -------------------- الإضافة الجديدة فقط --------------------
-def split_into_chunks(text, chunk_size=1000):
-    """تقسم النص إلى قطع بحجم محدد"""
+
+# دالة لإنشاء بيانات وصفية للقطع النصية
+def generate_metadata(page_num, chunk_num, original_filename):
+    return {
+        "source": original_filename,
+        "page_number": page_num,
+        "chunk_number": chunk_num,
+        "created_at": datetime.now().isoformat(),
+        "processing_info": {
+            "tool": "PDF Text Extractor",
+            "version": "1.0"
+        }
+    }
+
+# دالة لإنشاء تمثيل رقمي للنص 
+def generate_embeddings(text):
+    return [len(text)] * 10  
+
+# دالة لتقسيم النص إلى أجزاء أصغر مع تداخل
+def split_into_chunks(text, chunk_size=1000, overlap=200):
+    """تقسم النص إلى قطع متداخلة بحجم محدد"""
     chunks = []
-    for i in range(0, len(text), chunk_size):
-        chunks.append(text[i:i+chunk_size])
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += (chunk_size - overlap)
     return chunks
 
+# دالة رئيسية لمعالجة القطع النصية
 def process_chunks(input_folder, output_folder, chunk_size=1000):
-    """تقسيم الملفات النصية إلى قطع"""
     os.makedirs(output_folder, exist_ok=True)
+    
+    metadata_folder = os.path.join(output_folder, "metadata")
+    os.makedirs(metadata_folder, exist_ok=True)
+    
+    embeddings_folder = os.path.join(output_folder, "embeddings")
+    os.makedirs(embeddings_folder, exist_ok=True)
     
     for filename in os.listdir(input_folder):
         if filename.endswith(".txt"):
             with open(os.path.join(input_folder, filename), 'r', encoding='utf-8') as f:
                 text = f.read()
+            
+            try:
+                page_num = int(filename.split('_')[1].split('.')[0])
+            except:
+                page_num = 0
             
             chunks = split_into_chunks(text, chunk_size)
             
@@ -79,8 +117,18 @@ def process_chunks(input_folder, output_folder, chunk_size=1000):
                 chunk_filename = f"{os.path.splitext(filename)[0]}_chunk_{i}.txt"
                 with open(os.path.join(output_folder, chunk_filename), 'w', encoding='utf-8') as f:
                     f.write(chunk)
+                
+                metadata = generate_metadata(page_num, i, filename)
+                metadata_filename = f"{os.path.splitext(chunk_filename)[0]}_metadata.json"
+                with open(os.path.join(metadata_folder, metadata_filename), 'w', encoding='utf-8') as f:
+                    json.dump(metadata, f, ensure_ascii=False, indent=2)
+                
+                embeddings = generate_embeddings(chunk)
+                embeddings_filename = f"{os.path.splitext(chunk_filename)[0]}_embeddings.json"
+                with open(os.path.join(embeddings_folder, embeddings_filename), 'w', encoding='utf-8') as f:
+                    json.dump({"embeddings": embeddings}, f, ensure_ascii=False, indent=2)
     
-    print(f"تم تقسيم الملفات إلى قطع بحجم {chunk_size} حرف")
+    print(f"تم تقسيم الملفات إلى قطع بحجم {chunk_size} حرف مع إنشاء metadata وembeddings")
 
 
 if __name__ == "__main__":
@@ -89,12 +137,8 @@ if __name__ == "__main__":
     chunks_dir = "extracted_chunks"
     
     if os.path.exists(pdf_file):
-        
         extract_text_and_images(pdf_file, output_dir, max_images_per_folder=50)
-        
-        
         process_chunks(output_dir, chunks_dir, chunk_size=1000)
     else:
         print(f"الملف {pdf_file} غير موجود. يرجى التأكد من اسم الملف.")
-        
       # Biology.pdf

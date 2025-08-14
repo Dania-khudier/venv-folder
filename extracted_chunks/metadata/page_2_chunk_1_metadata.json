@@ -1,0 +1,10 @@
+{
+  "source": "page_2.txt",
+  "page_number": 2,
+  "chunk_number": 1,
+  "created_at": "2025-08-14T10:51:22.084594",
+  "processing_info": {
+    "tool": "PDF Text Extractor",
+    "version": "1.0"
+  }
+}
